@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
 import { FindingAutoChat } from "@/components/finding-auto-chat";
+import { FindingReportReview } from "@/components/finding-report-review";
 import { FindingReproductionPanel } from "@/components/finding-reproduction-panel";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
@@ -162,7 +163,8 @@ function FindingDetailInner() {
     );
   }
 
-  const structuredReproduction = usesStructuredReproduction(finding.report || "");
+  const report = finding.report && /\S/.test(finding.report) ? finding.report : "";
+  const structuredReproduction = usesStructuredReproduction(report);
 
   return (
     <>
@@ -245,6 +247,7 @@ function FindingDetailInner() {
                     </p>
                   </CardContent>
                 </Card>
+                {report && <FindingReportReview report={report} ui={ui} />}
                 {structuredReproduction ? (
                   <FindingReproductionPanel finding={finding} contextTask={contextTaskId || undefined} />
                 ) : (
@@ -274,9 +277,7 @@ function FindingDetailInner() {
                       <CardHeader className="flex-row items-center justify-between">
                         <CardTitle className="text-sm">{ui("screen.566e5ab4ab0638")}</CardTitle>
                         <div className="flex flex-wrap items-center justify-end gap-2">
-                          {finding.report && (
-                            <CopyButton text={finding.report} successMessage={ui("screen.10a2e40390af5f")} />
-                          )}
+                          {report && <CopyButton text={report} successMessage={ui("screen.10a2e40390af5f")} />}
                           {!finding.inherited ? (
                             <Button
                               variant="outline"
@@ -290,7 +291,7 @@ function FindingDetailInner() {
                               ) : (
                                 <FileTextIcon data-icon="inline-start" />
                               )}
-                              {finding.report ? ui("screen.f84bafca63ccf1") : ui("screen.dcd161e3bed30d")}
+                              {report ? ui("screen.f84bafca63ccf1") : ui("screen.dcd161e3bed30d")}
                             </Button>
                           ) : null}
                         </div>
@@ -301,8 +302,8 @@ function FindingDetailInner() {
                             <AlertDescription>{ui("screen.2ba06b4abdd2d0")}</AlertDescription>
                           </Alert>
                         ) : null}
-                        {finding.report ? (
-                          <Markdown text={finding.report} />
+                        {report ? (
+                          <Markdown text={report} />
                         ) : (
                           <p className="text-sm text-muted-foreground">{ui("screen.6283d9ab225878")}</p>
                         )}

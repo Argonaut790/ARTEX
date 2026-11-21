@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -37,7 +40,7 @@ func (m *basicAuthMemoryStore) SetSettingContext(ctx context.Context, _ string, 
 func basicAuthTestServer(t *testing.T) (*Server, *basicAuthMemoryStore) {
 	t.Helper()
 	store := &basicAuthMemoryStore{}
-	s := &Server{jwtKey: []byte("test-only-signing-key-32-characters")}
+	s := authTestServer(t, ":memory:")
 	if err := s.basicAuth.load(store); err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +243,10 @@ func TestBasicAuthGate(t *testing.T) {
 	if verifyJWT(cookie.Value, s.jwtKey) {
 		t.Fatal("gate cookie accepted as admin JWT")
 	}
-	adminJWT, _ := signJWT(s.jwtKey)
+	adminJWT, err := testAdminJWT(t, s)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name, path, user, pass, bearer string
 		cookie                         *http.Cookie
@@ -428,42 +434,31 @@ func TestBasicAuthCORS(t *testing.T) {
 }
 
 func TestBasicAuthPostgresLoginFlow(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
+	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("postgres unavailable: %v", err)
+		t.Skip("postgres unavailable")
 	}
-	defer m.Close()
-	for _, key := range []string{basicAuthKey, authPassKey} {
-		old, exists, err := m.pg.GetSetting(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func(key, old string, exists bool) {
-			if exists {
-				_ = m.pg.SetSetting(key, old)
-			} else {
-				_, _ = m.pg.Exec("DELETE FROM settings WHERE key=$1", key)
-			}
-		}(key, old, exists)
-	}
-	if err := m.pg.SetSetting(basicAuthKey, `{"enabled":false}`); err != nil {
-		t.Fatal(err)
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte("admin-password"), bcrypt.MinCost)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
+		t.Fatal("invalid test database configuration")
+	}
+	cfg.RuntimeParams["search_path"] = "pg_temp"
+	pool := stdlib.OpenDB(*cfg)
+	pool.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = pool.Close() })
+	if err := pool.PingContext(t.Context()); err != nil {
+		t.Skip("postgres unavailable")
+	}
+	if _, err := pool.Exec(`CREATE TEMP TABLE settings (
+		key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.pg.SetSetting(authPassKey, string(hash)); err != nil {
-		t.Fatal(err)
-	}
-	s := &Server{m: m, jwtKey: []byte("test-only-signing-key-32-characters")}
+	m := &Manager{pg: &db.DB{DB: pool}}
+	s := &Server{m: m, adminDB: m.pg, jwtKey: []byte("test-only-signing-key-32-characters")}
 	if err := s.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	adminJWT := adminRequest(t, s.Handler(), "POST", "/api/auth/init", "", `{"password":"admin-password"}`, 200)
 	body := `{"enabled":true,"username":"entry","password":"entry-password"}`
 	r := httptest.NewRequest("PUT", "/api/settings/basic-auth", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -479,7 +474,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Fatalf("save: %d %s", w.Code, w.Body.String())
 	}
 
-	restarted := &Server{m: m, jwtKey: s.jwtKey}
+	restarted := &Server{m: m, adminDB: m.pg, jwtKey: s.jwtKey}
 	if err := restarted.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +522,7 @@ func TestBasicAuthExpiredSessionRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
+	adminJWT, err := testAdminJWT(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}

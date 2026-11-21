@@ -678,7 +678,7 @@ func (s *Server) registerSideRoutes(mux *http.ServeMux) {
 			})
 		}
 	}
-	mux.HandleFunc("GET /api/side-questions/{requestID}/events", s.sideEvents)
+	mux.HandleFunc("GET /api/side-questions/{requestID}/events", s.adminStream(s.sideEvents))
 	mux.HandleFunc("POST /api/side-questions/{requestID}/cancel", s.cancelSideRequest)
 }
 

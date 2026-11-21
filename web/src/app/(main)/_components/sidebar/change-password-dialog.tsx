@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { localizedError } from "@/i18n/errors";
 import { api } from "@/lib/api";
+import { auth } from "@/lib/auth";
 
 export function ChangePasswordDialog({
   open,
@@ -53,7 +54,7 @@ export function ChangePasswordDialog({
     }
     setSaving(true);
     api
-      .changePassword(oldPassword, newPassword)
+      .changePassword(oldPassword, newPassword, auth.setToken)
       .then(() => {
         toast.success(t("account.passwordChanged"));
         onOpenChange(false);

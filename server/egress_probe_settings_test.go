@@ -41,7 +41,7 @@ func TestEgressProbeSettingsPersistence(t *testing.T) {
 		cancel()
 		s.Close()
 	}()
-	token, err := signJWT(s.jwtKey)
+	token, err := testAdminJWT(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}

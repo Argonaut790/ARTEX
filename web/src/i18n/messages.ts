@@ -3,6 +3,7 @@ import { errorMessages } from "./error-messages";
 import { inlineEditorMessages } from "./inline-editor-messages";
 import { notifyMessages } from "./notify-messages";
 import { overviewMessages } from "./overview-messages";
+import { reportReviewMessages } from "./report-review-messages";
 import { scheduleMessages } from "./schedule-messages";
 import screenCatalog from "./screen-catalog.json";
 import { settingsMessages } from "./settings-messages";
@@ -21,6 +22,7 @@ export const messages = {
   ...chatUIMessages,
   ...errorMessages,
   ...overviewMessages,
+  ...reportReviewMessages,
   ...settingsMessages,
   ...settingsRuntimeMessages,
   "common.cancel": ["取消", "Cancel"],
@@ -76,8 +78,8 @@ export const messages = {
   "account.confirmChange": ["确认修改", "Confirm change"],
   "account.usernameFixed": ["用户名固定为", "The username is"],
   "account.tokenNotice": [
-    "。需先输入当前密码验证；修改后已签发的登录 token 仍有效直至过期。",
-    ". Enter your current password to verify your identity. Existing sign-in tokens remain valid until they expire.",
+    "。修改密码后，此浏览器会保持登录，其他浏览器需要重新登录。",
+    ". After you change the password, this browser stays signed in. Other browsers must sign in again.",
   ],
   "account.changeFailed": ["修改失败：{{message}}", "Could not change password: {{message}}"],
   "auth.backendUnavailable": ["无法连接到后端服务", "Unable to connect to the backend service"],

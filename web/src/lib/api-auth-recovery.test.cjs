@@ -1,19 +1,41 @@
 const assert = require("node:assert/strict");
+const { webcrypto } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 const ts = require("typescript");
 
-const compiled = ts.transpileModule(fs.readFileSync(path.join(__dirname, "api.ts"), "utf8"), {
+const compile = (file) => ts.transpileModule(fs.readFileSync(path.join(__dirname, file), "utf8"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
+const compiled = compile("api.ts");
+const compiledAuth = compile("auth.ts");
 
-function client(fetch) {
+function browserSession() {
+  const items = new Map([["artex_token", "original-admin-token"]]);
+  return {
+    document: { cookie: "artex_token=original-admin-token" },
+    localStorage: {
+      get length() { return items.size; },
+      key: (index) => Array.from(items.keys())[index] ?? null,
+      getItem: (key) => items.get(key) ?? null,
+      setItem: (key, value) => items.set(key, value),
+      removeItem: (key) => items.delete(key),
+    },
+  };
+}
+
+function client(fetch, { localStorage, document } = browserSession()) {
   const exports = {};
-  const state = { token: "original-admin-token", reloads: 0, requests: [], streams: [] };
+  const state = {
+    get token() { return localStorage.getItem("artex_token"); },
+    set token(value) { localStorage.setItem("artex_token", value); },
+    reloads: 0, requests: [], streams: [],
+  };
   const location = { href: "http://localhost/function/tasks/?page=2", hostname: "localhost", reload: () => state.reloads++ };
-  const document = { cookie: "artex_token=original-admin-token" };
+  const authModule = {};
+  vm.runInNewContext(compiledAuth, { exports: authModule, window: { location }, document, localStorage, process: { env: {} } });
   class EventSource {
     constructor(url, options) { this.url = url; this.options = options; this.listeners = {}; state.streams.push(this); }
     addEventListener(name, listener) { this.listeners[name] = listener; }
@@ -22,7 +44,7 @@ function client(fetch) {
     exports, URL, URLSearchParams, FormData, EventSource,
     process: { env: { NODE_ENV: "production" } },
     window: { location }, document,
-    localStorage: { getItem: () => state.token, removeItem: () => { state.token = null; } },
+    localStorage, crypto: webcrypto,
     require: (id) => {
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected mock request") };
@@ -30,7 +52,7 @@ function client(fetch) {
     },
     fetch: async (...args) => { state.requests.push(args); return fetch(...args); },
   });
-  return { ...exports, state, location, document };
+  return { ...exports, auth: authModule.auth, state, location, document };
 }
 
 const gateFailure = () => new Response('{"error":"请先完成 HTTP Basic Auth 验证","code":"basic_auth_required"}', {
@@ -115,6 +137,110 @@ test("uploads and downloads also recover the Basic gate", async () => {
 });
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a protected 401 cannot clear a password change in either response order", async () => {
+  for (const earlyFailure of [true, false]) {
+    let releaseChange;
+    let releaseFailure;
+    const changeResponse = new Promise((resolve) => { releaseChange = resolve; });
+    const failureResponse = new Promise((resolve) => { releaseFailure = resolve; });
+    const c = client((url) => url === "/api/auth/change-password" ? changeResponse : failureResponse);
+    const failedRequest = assert.rejects(c.http("/version"), (error) => error.code === "token_expired");
+    const changing = c.api.changePassword("fixture-password", "replacement-password", (token) => {
+      c.state.token = token;
+      c.document.cookie = `artex_token=${token}`;
+    });
+    const failure = () => releaseFailure(new Response('{"code":"token_expired"}', { status: 401 }));
+    if (earlyFailure) {
+      failure();
+      await tick();
+      assertSessionPreserved(c);
+    }
+    releaseChange(new Response('{"ok":true,"token":"replacement-token"}'));
+    await changing;
+    if (!earlyFailure) failure();
+    await failedRequest;
+    assert.equal(c.state.token, "replacement-token");
+    assert.equal(c.document.cookie, "artex_token=replacement-token");
+    assert.equal(c.location.href, "http://localhost/function/tasks/?page=2");
+  }
+});
+
+test("a wrong current password leaves the existing login available for retry", async () => {
+  const c = client(() => new Response('{"code":"current_password_incorrect"}', { status: 401 }));
+  await assert.rejects(c.api.changePassword("incorrect", "replacement-password", () => {
+    assert.fail("a failed change attempted to replace the token");
+  }), (error) => error.code === "current_password_incorrect");
+  assertSessionPreserved(c);
+});
+
+test("a second tab's 401 preserves the changing tab's replacement in both response orders", async () => {
+  for (const earlyFailure of [true, false]) {
+    const shared = browserSession();
+    let releaseChange, releaseFailure;
+    const changingTab = client(() => new Promise((resolve) => { releaseChange = resolve; }), shared);
+    const otherTab = client(() => new Promise((resolve) => { releaseFailure = resolve; }), shared);
+    const pendingRequest = assert.rejects(otherTab.http("/version"), (error) => error.code === "token_expired");
+    const changing = changingTab.api.changePassword("old-password", "new-password", changingTab.auth.setToken);
+    const fail = () => releaseFailure(new Response('{"code":"token_expired"}', { status: 401 }));
+    if (earlyFailure) {
+      fail();
+      await pendingRequest;
+      assertSessionPreserved(otherTab);
+    }
+    releaseChange(new Response('{"ok":true,"token":"replacement-token"}'));
+    await changing;
+    if (!earlyFailure) { fail(); await pendingRequest; }
+    assert.equal(otherTab.auth.getToken(), "replacement-token");
+    assert.match(shared.document.cookie, /^artex_token=replacement-token;/);
+    assert.equal(otherTab.location.href, "http://localhost/function/tasks/?page=2");
+    assert.equal(shared.localStorage.length, 1);
+  }
+});
+
+test("a pending rotation cannot undo another tab's logout or overwrite a new login", async () => {
+  for (const nextLogin of [null, "original-admin-token", "another-login-token"]) {
+    const shared = browserSession();
+    let release;
+    const changingTab = client(() => new Promise((resolve) => { release = resolve; }), shared);
+    const otherTab = client(() => assert.fail("unexpected request"), shared);
+    const changing = changingTab.api.changePassword("old-password", "new-password", changingTab.auth.setToken);
+    otherTab.auth.clearToken();
+    if (nextLogin !== null) otherTab.auth.setToken(nextLogin);
+    const cookie = shared.document.cookie;
+    release(new Response('{"ok":true,"token":"replacement-token"}'));
+    await changing;
+    assert.equal(otherTab.auth.getToken(), nextLogin);
+    assert.equal(shared.document.cookie, cookie);
+    assert.equal(shared.localStorage.length, nextLogin === null ? 0 : 1);
+  }
+});
+
+test("an abandoned rotation expires and the next 401 clears the revoked login", async () => {
+  const shared = browserSession();
+  let release;
+  const abandoned = client(() => new Promise((resolve) => { release = resolve; }), shared);
+  const otherTab = client(() => new Response('{"code":"token_expired"}', { status: 401 }), shared);
+  const changing = abandoned.api.changePassword("old-password", "new-password", abandoned.auth.setToken);
+  const marker = shared.localStorage.key(1);
+  assert.ok(Number(shared.localStorage.getItem(marker)) <= Date.now() + 60_000);
+  shared.localStorage.setItem(marker, String(Date.now() - 1));
+  await assert.rejects(otherTab.http("/version"), (error) => error.code === "token_expired");
+  assert.equal(otherTab.location.href, "/login");
+  assert.equal(shared.localStorage.length, 0);
+  release(new Response('{"ok":true,"token":"late-token"}'));
+  await changing;
+  assert.equal(otherTab.auth.getToken(), null);
+});
+
+test("a change attempted with a revoked session returns to login immediately", async () => {
+  const shared = browserSession();
+  const c = client(() => new Response('{"code":"token_expired"}', { status: 401 }), shared);
+  await assert.rejects(c.api.changePassword("old-password", "new-password", c.auth.setToken),
+    (error) => error.code === "token_expired");
+  assert.equal(c.location.href, "/login");
+  assert.equal(shared.localStorage.length, 0);
+});
 
 test("SSE failures probe the same-origin gate once for concurrent streams", async () => {
   const c = client(async () => gateFailure());
