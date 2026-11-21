@@ -3,16 +3,15 @@ import { type CVSS4BaseScore, isExtendedCVSS4Vector, scoreCVSS4Base } from "./cv
 const sectionNames = {
   summary: ["概述", "概览", "概覽", "漏洞概述", "summary", "overview", "executive summary", "finding summary"],
   impact: ["影响与危害", "影响", "影響與危害", "影響", "impact", "business impact", "impact and risk"],
-  scope: [
-    "受影响范围", "受影響範圍", "scope", "affected scope", "affected assets", "affected systems",
-    "前置条件", "前置條件", "prerequisites", "preconditions",
-  ],
+  scope: ["受影响范围", "受影響範圍", "scope", "affected scope", "affected assets", "affected systems"],
+  prerequisites: ["前置条件", "前置條件", "prerequisites", "preconditions"],
   cause: ["根因分析", "根本原因", "root cause", "root cause analysis"],
   remediation: ["修复建议", "修復建議", "修复", "修復", "remediation", "recommendations", "mitigation"],
   description: ["描述", "漏洞描述", "description", "finding description", "vulnerability description"],
   testing: ["测试过程", "測試過程", "test process", "testing process", "testing", "test procedure"],
 } as const;
-export type ReportSectionId = keyof typeof sectionNames;
+type SourceSectionId = keyof typeof sectionNames;
+export type ReportSectionId = Exclude<SourceSectionId, "prerequisites">;
 export type ReportSeverity = CVSS4BaseScore["severity"];
 type SectionStatus = "present" | "empty" | "missing";
 type CVSSStatus = "absent" | "invalid" | "unsupported" | "unscored" | "mismatch" | "match";
@@ -31,8 +30,8 @@ export interface ReportReview {
   http: { status: "absent" | "partial" | "paired" | "not-applicable"; exchanges: Exchange[] };
 }
 
-const sectionByName = new Map<string, ReportSectionId>();
-for (const id of Object.keys(sectionNames) as ReportSectionId[]) {
+const sectionByName = new Map<string, SourceSectionId>();
+for (const id of Object.keys(sectionNames) as SourceSectionId[]) {
   for (const name of sectionNames[id]) sectionByName.set(name, id);
 }
 
@@ -256,9 +255,9 @@ function checkHttp(parts: Fragment[]): ReportReview["http"] {
 
 export function inspectReport(markdown: string): ReportReview {
   const parts = [...fragments(markdown)];
-  const sections = new Map<ReportSectionId, SectionStatus>();
+  const sections = new Map<SourceSectionId, SectionStatus>();
   const metadata: string[] = [];
-  let current: { id: ReportSectionId; depth: number } | null = null;
+  let current: { id: SourceSectionId; depth: number } | null = null;
   for (const part of parts) {
     if (part.kind === "heading") {
       if (current && part.depth <= current.depth) current = null;
@@ -280,8 +279,9 @@ export function inspectReport(markdown: string): ReportReview {
   const required: ReportSectionId[] = delivery
     ? ["description", "testing", "remediation"]
     : ["summary", "impact", "scope", "cause", "remediation"];
-  if (!delivery && !sections.has("summary") && sections.has("description")) {
-    sections.set("summary", sections.get("description") ?? "empty");
+  if (!delivery) {
+    sections.set("summary", sections.get("summary") ?? sections.get("description") ?? "missing");
+    sections.set("scope", sections.get("scope") ?? sections.get("prerequisites") ?? "missing");
   }
   return {
     profile: delivery ? "delivery" : "legacy",

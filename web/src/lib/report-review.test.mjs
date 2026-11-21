@@ -116,6 +116,18 @@ test("legacy prerequisite headings need content before the next section", () => 
   }
 });
 
+test("optional prerequisites keep the delivery profile and explicit legacy scope takes precedence", () => {
+  const delivery = inspectReport([
+    "## 描述", "Example.", "## Prerequisites", "A local sample.", "## 测试过程", "Sample reviewed.",
+    "## 修复建议", "Correct the record.",
+  ].join("\n"));
+  assert.equal(delivery.profile, "delivery");
+  assert.deepEqual(statuses(delivery), { description: "present", testing: "present", remediation: "present" });
+  const legacy = inspectReport("## Description\nExample.\n## Scope\n## Prerequisites\nSample.");
+  assert.equal(legacy.profile, "legacy");
+  assert.equal(statuses(legacy).scope, "empty");
+});
+
 test("detects missing and empty sections without counting prose, comments or fenced headings", () => {
   const report = inspectReport(
     [
