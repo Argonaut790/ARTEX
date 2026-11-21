@@ -3,7 +3,10 @@ import { type CVSS4BaseScore, isExtendedCVSS4Vector, scoreCVSS4Base } from "./cv
 const sectionNames = {
   summary: ["概述", "概览", "概覽", "漏洞概述", "summary", "overview", "executive summary", "finding summary"],
   impact: ["影响与危害", "影响", "影響與危害", "影響", "impact", "business impact", "impact and risk"],
-  scope: ["受影响范围", "受影響範圍", "scope", "affected scope", "affected assets", "affected systems"],
+  scope: [
+    "受影响范围", "受影響範圍", "scope", "affected scope", "affected assets", "affected systems",
+    "前置条件", "前置條件", "prerequisites", "preconditions",
+  ],
   cause: ["根因分析", "根本原因", "root cause", "root cause analysis"],
   remediation: ["修复建议", "修復建議", "修复", "修復", "remediation", "recommendations", "mitigation"],
   description: ["描述", "漏洞描述", "description", "finding description", "vulnerability description"],
@@ -107,6 +110,7 @@ function* fragments(markdown: string): Generator<Fragment> {
       yield { kind: "text", text: line.trim() };
     }
   }
+  if (fence) yield { kind: "code", filled: fence.line > 0, packet: fence.packet, line: fence.line };
 }
 
 const severityNames: Record<string, ReportSeverity> = {
@@ -255,7 +259,6 @@ export function inspectReport(markdown: string): ReportReview {
   const sections = new Map<ReportSectionId, SectionStatus>();
   const metadata: string[] = [];
   let current: { id: ReportSectionId; depth: number } | null = null;
-  let alternateScope = false;
   for (const part of parts) {
     if (part.kind === "heading") {
       if (current && part.depth <= current.depth) current = null;
@@ -265,7 +268,6 @@ export function inspectReport(markdown: string): ReportReview {
         current = { id, depth: part.depth };
         if (!sections.has(id)) sections.set(id, "empty");
       }
-      if (/^(?:前置[条條]件|prerequisites|preconditions)$/.test(part.text)) alternateScope = true;
       continue;
     }
     if (part.kind === "text") metadata.push(part.text);
@@ -275,12 +277,11 @@ export function inspectReport(markdown: string): ReportReview {
   }
   const legacy = ["summary", "scope", "cause", "impact"] as const;
   const delivery = (sections.has("testing") || sections.has("description")) && !legacy.some((id) => sections.has(id));
-  const required: ReportSectionId[] = delivery ? ["description", "testing", "remediation"] : ["summary", "impact"];
-  if (!delivery) {
-    if (sections.has("scope") || !alternateScope) required.push("scope");
-    required.push("cause", "remediation");
-    if (!sections.has("summary") && sections.has("description"))
-      sections.set("summary", sections.get("description") ?? "empty");
+  const required: ReportSectionId[] = delivery
+    ? ["description", "testing", "remediation"]
+    : ["summary", "impact", "scope", "cause", "remediation"];
+  if (!delivery && !sections.has("summary") && sections.has("description")) {
+    sections.set("summary", sections.get("description") ?? "empty");
   }
   return {
     profile: delivery ? "delivery" : "legacy",

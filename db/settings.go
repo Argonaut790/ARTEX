@@ -29,6 +29,9 @@ func (d *DB) GetAdminCredentials(ctx context.Context) (AdminCredentials, error) 
 	if (hash.Valid && hash.String == "") || (generation.Valid && generation.String == "") {
 		return AdminCredentials{}, errors.New("empty admin credential setting")
 	}
+	if generation.Valid && !hash.Valid {
+		return AdminCredentials{}, errors.New("admin session generation without a password hash")
+	}
 	return AdminCredentials{PasswordHash: hash.String, Generation: generation.String}, nil
 }
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -88,6 +89,10 @@ type adminClaims struct {
 	Generation string `json:"auth_generation,omitempty"`
 }
 
+func (claims adminClaims) matches(credentials db.AdminCredentials) bool {
+	return credentials.PasswordHash != "" && claims.Generation == credentials.Generation
+}
+
 func signAdminJWT(key []byte, generation string) (string, error) {
 	now := time.Now()
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, adminClaims{
@@ -108,8 +113,8 @@ func parseAdminJWT(tokenStr string, key []byte) (adminClaims, error) {
 }
 
 func (s *Server) readAdminCredentials(w http.ResponseWriter, r *http.Request) (db.AdminCredentials, bool) {
-	if s.m != nil && s.m.pg != nil {
-		if credentials, err := s.m.pg.GetAdminCredentials(r.Context()); err == nil {
+	if s.adminDB != nil {
+		if credentials, err := s.adminDB.GetAdminCredentials(r.Context()); err == nil {
 			return credentials, true
 		}
 	}
@@ -131,7 +136,7 @@ func (s *Server) authenticatedAdmin(w http.ResponseWriter, r *http.Request) (db.
 		if !ok {
 			return db.AdminCredentials{}, false
 		}
-		if claims.Generation == credentials.Generation {
+		if claims.matches(credentials) {
 			return credentials, true
 		}
 	}
@@ -165,6 +170,70 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// The enclosing requireAuth checks admission. Only open SSE responses need to
+// recheck the shared generation. A rotation or a stalled database read closes
+// the subscription within the poll interval plus the read timeout.
+const (
+	adminStreamPollInterval = 2 * time.Second
+	adminStreamReadTimeout  = time.Second
+)
+
+func (s *Server) adminStream(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, err := parseAdminJWT(extractToken(r), s.jwtKey)
+		if err != nil {
+			writeProductError(w, 401, "token_expired", "token 无效或已过期", nil)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeErr(w, 500, "streaming unsupported")
+			return
+		}
+		ctx, cancel := context.WithDeadline(r.Context(), claims.ExpiresAt.Time)
+		defer cancel()
+		go func() {
+			tick := time.NewTicker(adminStreamPollInterval)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					readCtx, stop := context.WithTimeout(ctx, adminStreamReadTimeout)
+					current, err := s.adminDB.GetAdminCredentials(readCtx)
+					stop()
+					if err != nil || !claims.matches(current) {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+		h(adminStreamWriter{w, flusher, ctx}, r.WithContext(ctx))
+	}
+}
+
+// Ignore queued events and unfinished history replay after revocation.
+type adminStreamWriter struct {
+	http.ResponseWriter
+	flusher http.Flusher
+	ctx     context.Context
+}
+
+func (w adminStreamWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w adminStreamWriter) Flush() {
+	if w.ctx.Err() == nil {
+		w.flusher.Flush()
+	}
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
@@ -216,7 +285,7 @@ func (s *Server) replaceAdminPassword(w http.ResponseWriter, r *http.Request, ol
 		writeProductError(w, 500, "token_failed", "token 生成失败", nil)
 		return
 	}
-	replaced, err := s.m.pg.ReplaceAdminCredentials(r.Context(), old, next)
+	replaced, err := s.adminDB.ReplaceAdminCredentials(r.Context(), old, next)
 	if err != nil {
 		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
 		return
@@ -255,10 +324,6 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if msg := validatePassword(req.NewPassword); msg != "" {
 		code, params := passwordValidationCode(req.NewPassword)
 		writeProductError(w, 400, code, msg, params)
-		return
-	}
-	if credentials.PasswordHash == "" {
-		writeProductError(w, 403, "password_not_initialized", "密码未初始化，请先设置密码", nil)
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(credentials.PasswordHash), []byte(req.OldPassword)); err != nil {

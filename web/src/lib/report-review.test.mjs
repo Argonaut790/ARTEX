@@ -103,7 +103,16 @@ test("legacy report profiles accept English, Chinese and the alternative prerequ
   ]) {
     const report = inspectReport(names.map((name) => "## " + name + "\nSample content.").join("\n"));
     assert.equal(report.profile, "legacy");
+    assert.equal(statuses(report).scope, "present");
     assert.ok(report.sections.every((s) => s.status === "present"));
+  }
+});
+
+test("legacy prerequisite headings need content before the next section", () => {
+  for (const heading of ["Prerequisites", "Preconditions", "前置条件", "前置條件"]) {
+    const report = inspectReport(["## Summary", "Overview.", "## " + heading, "## Impact", "Example."].join("\n"));
+    assert.equal(report.profile, "legacy");
+    assert.equal(statuses(report).scope, "empty");
   }
 });
 
@@ -147,6 +156,14 @@ test("counts recorded packets inside the same exchange and returns line numbers 
     exchanges: [{ requestLine: 4, responseLine: 9 }],
   });
   assert.doesNotMatch(JSON.stringify(inspectReport(markdown)), /sample-note|marker-for-test/);
+});
+
+test("an open final fence contains the rest of the report", () => {
+  const report = inspectReport(["## Summary", "~~~http", "GET /example HTTP/1.1", "## Impact", example].join("\n"));
+  assert.equal(statuses(report).summary, "present");
+  assert.equal(statuses(report).impact, "missing");
+  assert.equal(report.cvss.status, "absent");
+  assert.deepEqual(report.http, { status: "partial", exchanges: [{ requestLine: 3, responseLine: null }] });
 });
 
 test("different report sections, prose and different exchange IDs cannot create a pair", () => {

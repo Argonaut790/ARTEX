@@ -1,6 +1,13 @@
 const TOKEN_KEY = "artex_token";
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60; // 7 天（秒）
 
+function cancelPasswordChanges() {
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const key = localStorage.key(i);
+    if (key?.startsWith("artex_password_change.")) localStorage.removeItem(key);
+  }
+}
+
 export interface CurrentUser {
   id: string;
   name: string;
@@ -24,6 +31,7 @@ export const auth = {
   },
 
   clearToken(): void {
+    cancelPasswordChanges();
     localStorage.removeItem(TOKEN_KEY);
     document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`;
   },

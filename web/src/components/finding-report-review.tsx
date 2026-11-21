@@ -5,6 +5,27 @@ import { useMemo, useState } from "react";
 import type { UITranslate } from "@/i18n/use-ui-translation";
 import { inspectReport, type ReportReview } from "@/lib/report-review";
 
+// A saved report can contain large HTTP captures. Scan those only when the reader expands the review.
+const AUTO_REVIEW_CHAR_LIMIT = 64 * 1024;
+
+function reviewSummary(review: ReportReview, ui: UITranslate) {
+  const sectionIssues = review.sections.filter(({ status }) => status !== "present").length;
+  const scoreIssue = review.cvss.status === "invalid" || review.cvss.status === "mismatch";
+  const incompletePairs = review.http.exchanges.reduce(
+    (count, { requestLine, responseLine }) => count + Number(requestLine === null || responseLine === null),
+    0,
+  );
+  const count = sectionIssues + Number(scoreIssue) + incompletePairs;
+  if (count) return ui("reportReview.summary.issues", { count });
+
+  const notes: string[] = [];
+  if (review.cvss.status !== "match") notes.push(ui(`reportReview.summary.cvss.${review.cvss.status}`));
+  if (review.http.status === "absent" || review.http.status === "not-applicable") {
+    notes.push(ui(`reportReview.summary.http.${review.http.status}`));
+  }
+  return notes.length ? notes.join(" · ") : ui("reportReview.summary.clear");
+}
+
 function scoreLabel(score: number | null, severity: ReportReview["cvss"]["severity"], ui: UITranslate) {
   const parts: string[] = [];
   if (score !== null) parts.push(score.toFixed(1));
@@ -13,18 +34,21 @@ function scoreLabel(score: number | null, severity: ReportReview["cvss"]["severi
 }
 
 export function FindingReportReview({ report, ui }: { report: string; ui: UITranslate }) {
-  const [opened, setOpened] = useState(false);
-  const review = useMemo(() => (opened ? inspectReport(report) : null), [opened, report]);
+  const [disclosure, setDisclosure] = useState<"initial" | "open" | "closed">("initial");
+  const shouldInspect = report.length <= AUTO_REVIEW_CHAR_LIMIT || disclosure !== "initial";
+  const review = useMemo(() => (shouldInspect ? inspectReport(report) : null), [shouldInspect, report]);
+  const summary = useMemo(() => (review ? reviewSummary(review, ui) : ui("reportReview.summary.deferred")), [review, ui]);
 
   return (
     <details
-      className="min-w-0 rounded-lg border bg-card text-card-foreground"
-      onToggle={(event) => setOpened(event.currentTarget.open)}
+      className="min-w-0 rounded-xl bg-card text-card-foreground ring-1 ring-foreground/10"
+      onToggle={(event) => setDisclosure(event.currentTarget.open ? "open" : "closed")}
     >
-      <summary className="cursor-pointer rounded-lg px-4 py-3 text-sm font-medium focus-visible:outline-ring">
-        {ui("reportReview.title")}
+      <summary className="cursor-pointer rounded-xl px-4 py-3 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+        <span className="font-medium">{ui("reportReview.title")}</span>{" "}
+        <span className="ml-1 text-xs text-muted-foreground">{summary}</span>
       </summary>
-      {review && (
+      {disclosure === "open" && review && (
         <div className="space-y-4 border-t px-4 py-3 text-sm">
           <div>
             <h3 className="font-medium">{ui("reportReview.sections")}</h3>

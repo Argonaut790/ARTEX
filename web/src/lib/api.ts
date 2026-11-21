@@ -147,7 +147,30 @@ function getToken(): string | null {
 
 let basicAuthReloading = false;
 let basicAuthProbe: Promise<void> | null = null;
-let pendingPasswordChange: Promise<unknown> | undefined;
+const passwordChangePrefix = "artex_password_change.";
+const passwordChangeLifetime = 60_000;
+
+// Each request owns one expiring marker so concurrent tabs cannot remove each
+// other's marker. Markers contain neither the password nor the admin token.
+function passwordChangeInProgress(): boolean {
+  const now = Date.now();
+  let active = false;
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(passwordChangePrefix)) continue;
+    const expires = Number(localStorage.getItem(key));
+    if (expires > now && expires <= now + passwordChangeLifetime) active = true;
+    else localStorage.removeItem(key);
+  }
+  return active;
+}
+
+function clearExpiredSession(token: string | null) {
+  if (basicAuthReloading || passwordChangeInProgress() || getToken() !== token) return;
+  localStorage.removeItem("artex_token");
+  document.cookie = "artex_token=; path=/; max-age=0";
+  window.location.href = "/login";
+}
 
 // Renew the outer gate through a page navigation, where the browser can send
 // Basic credentials without replacing an API request's Bearer authorization.
@@ -252,15 +275,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
     if (r.status === 401 && code !== "current_password_incorrect" && typeof window !== "undefined") {
-      // The server can revoke the old token before this tab receives its replacement.
-      if (path !== "/auth/change-password" && pendingPasswordChange) {
-        await pendingPasswordChange.catch(() => {});
-      }
-      if (!basicAuthReloading && getToken() === token) {
-        localStorage.removeItem("artex_token");
-        document.cookie = "artex_token=; path=/; max-age=0";
-        window.location.href = "/login";
-      }
+      // Another tab can receive this 401 before the changing tab gets its response.
+      clearExpiredSession(token);
     }
     throw new ApiError(message, code, params);
   }
@@ -429,18 +445,23 @@ export const api = {
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   changePassword: async (oldPassword: string, newPassword: string, saveToken: (token: string) => void) => {
     const originalToken = getToken();
-    const change = post<{ ok: boolean; token: string }>("/auth/change-password", {
-      old_password: oldPassword,
-      new_password: newPassword,
-    }).then((result) => {
-      if (result.token && getToken() === originalToken) saveToken(result.token);
-      return result;
-    });
-    pendingPasswordChange = change;
+    passwordChangeInProgress(); // Discard markers left by closed tabs.
+    const marker = passwordChangePrefix + Array.from(crypto.getRandomValues(new Uint32Array(4))).join("-");
+    localStorage.setItem(marker, String(Date.now() + passwordChangeLifetime));
+    let expired = false;
     try {
-      return await change;
+      const result = await post<{ ok: boolean; token: string }>("/auth/change-password", {
+        old_password: oldPassword,
+        new_password: newPassword,
+      });
+      if (result.token && localStorage.getItem(marker) !== null && getToken() === originalToken) saveToken(result.token);
+      return result;
+    } catch (error) {
+      expired = error instanceof ApiError && (error.code === "token_expired" || error.code === "unauthorized");
+      throw error;
     } finally {
-      if (pendingPasswordChange === change) pendingPasswordChange = undefined;
+      localStorage.removeItem(marker);
+      if (expired) clearExpiredSession(originalToken);
     }
   },
 
