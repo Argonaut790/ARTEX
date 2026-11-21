@@ -4,7 +4,7 @@
 #
 # 登录用户名固定为 ARTEX；密码以 bcrypt 哈希存放在数据库 settings 表的
 # auth.password_hash 键。本脚本连上数据库后，用 pgcrypto 在库内生成 bcrypt 哈希
-# 并写回该键——与后端登录校验（golang.org/x/crypto/bcrypt）完全兼容。
+# 并更新会话版本。重置成功后，所有管理员会话都需要重新登录。
 #
 # 两种部署：
 #   local （默认）—— 宿主机直接用 psql 连数据库。连接信息按以下优先级获取：
@@ -141,7 +141,8 @@ SQL=$(cat <<SQL
 \\getenv newpw ARTEX_RESET_NEWPASS
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 INSERT INTO settings(key, value)
-VALUES ('$PASS_KEY', crypt(:'newpw', gen_salt('bf', $BCRYPT_COST)))
+VALUES ('$PASS_KEY', crypt(:'newpw', gen_salt('bf', $BCRYPT_COST))),
+       ('auth.session_generation', encode(gen_random_bytes(16), 'hex'))
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 SQL
 )

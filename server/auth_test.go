@@ -1,11 +1,159 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Autumn-27/artex/db"
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite"
 )
+
+func authTestServer(t *testing.T, database string) *Server {
+	t.Helper()
+	pool, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = pool.Close() })
+	if _, err := pool.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	return &Server{m: &Manager{pg: &db.DB{DB: pool}}, jwtKey: []byte("test-only-signing-key-32-characters")}
+}
+
+// Existing request fixtures use the exact claims that older releases issued.
+func signJWT(key []byte) (string, error) {
+	now := time.Now()
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Subject: "ARTEX", IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(now.Add(jwtTTL)),
+	}).SignedString(key)
+}
+
+func verifyJWT(token string, key []byte) bool {
+	_, err := parseAdminJWT(token, key)
+	return err == nil
+}
+
+func adminRequest(t *testing.T, h http.Handler, method, path, token, body string, want int) string {
+	t.Helper()
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != want {
+		t.Fatalf("%s %s: status %d, want %d", method, path, w.Code, want)
+	}
+	var result struct{ Token string }
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if want != 200 && result.Token != "" {
+		t.Fatal("an unsuccessful request returned a token")
+	}
+	return result.Token
+}
+
+func TestAdminPasswordRotationAcrossInstances(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "settings.db")
+	s := authTestServer(t, file)
+	other := authTestServer(t, file)
+	first, second := s.Handler(), other.Handler()
+	initBody := `{"password":"fixture-password"}`
+	login := `{"username":"ARTEX","password":"fixture-password"}`
+	change := `{"old_password":"fixture-password","new_password":"replacement-password"}`
+	initial := adminRequest(t, first, "POST", "/api/auth/init", "", initBody, 200)
+	loginToken := adminRequest(t, second, "POST", "/api/auth/login", "", login, 200)
+	adminRequest(t, second, "POST", "/api/auth/init", "", initBody, 403)
+	adminRequest(t, first, "POST", "/api/auth/change-password", initial,
+		`{"old_password":"wrong-password","new_password":"replacement-password"}`, 401)
+	adminRequest(t, first, "GET", "/api/version", initial, "", 200)
+	replacement := adminRequest(t, first, "POST", "/api/auth/change-password", initial, change, 200)
+	adminRequest(t, second, "GET", "/api/version", loginToken, "", 401)
+	adminRequest(t, second, "GET", "/api/version", replacement, "", 200)
+	adminRequest(t, second, "POST", "/api/auth/change-password", initial,
+		`{"old_password":"replacement-password","new_password":"another-password"}`, 401)
+	adminRequest(t, first, "POST", "/api/auth/login", "", login, 401)
+	if err := s.m.pg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.m.pg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := authTestServer(t, file).Handler()
+	adminRequest(t, restarted, "GET", "/api/version", initial, "", 401)
+	adminRequest(t, restarted, "GET", "/api/version", replacement, "", 200)
+	fresh := adminRequest(t, restarted, "POST", "/api/auth/login", "",
+		`{"username":"ARTEX","password":"replacement-password"}`, 200)
+	adminRequest(t, restarted, "GET", "/api/version", fresh, "", 200)
+}
+
+func TestAdminLegacySessionUntilFirstRotation(t *testing.T) {
+	s := authTestServer(t, ":memory:")
+	hash, err := bcrypt.GenerateFromPassword([]byte("legacy-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.Exec("INSERT INTO settings (key,value) VALUES ($1,$2)", db.AdminPasswordKey, string(hash)); err != nil {
+		t.Fatal(err)
+	}
+	token, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler()
+	adminRequest(t, h, "GET", "/api/version", token, "", 200)
+	replacement := adminRequest(t, h, "POST", "/api/auth/change-password", token,
+		`{"old_password":"legacy-password","new_password":"legacy-password"}`, 200)
+	adminRequest(t, h, "GET", "/api/version", token, "", 401)
+	adminRequest(t, h, "GET", "/api/version", replacement, "", 200)
+}
+
+func TestAdminRotationRollbackAndStaleGeneration(t *testing.T) {
+	s := authTestServer(t, ":memory:")
+	h := s.Handler()
+	token := adminRequest(t, h, "POST", "/api/auth/init", "", `{"password":"fixture-password"}`, 200)
+	before, err := s.m.pg.GetAdminCredentials(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a concurrent change after the caller read the password.
+	stale := before
+	stale.Generation = "earlier-generation"
+	next := db.AdminCredentials{PasswordHash: "unused", Generation: "unused"}
+	if replaced, err := s.m.pg.ReplaceAdminCredentials(t.Context(), stale, next); err != nil || replaced {
+		t.Fatalf("stale compare-and-swap: replaced=%t err=%v", replaced, err)
+	}
+	if _, err := s.m.pg.Exec(`CREATE TRIGGER fail_rotation BEFORE UPDATE ON settings
+		WHEN OLD.key = 'auth.session_generation' BEGIN SELECT RAISE(ABORT,'test failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	adminRequest(t, h, "POST", "/api/auth/change-password", token,
+		`{"old_password":"fixture-password","new_password":"replacement-password"}`, 503)
+	after, err := s.m.pg.GetAdminCredentials(t.Context())
+	if err != nil || before != after {
+		t.Fatal("failed rotation changed persisted credentials")
+	}
+	adminRequest(t, h, "GET", "/api/version", token, "", 200)
+	if err := s.m.pg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	adminRequest(t, h, "GET", "/api/version", token, "", 503)
+	adminRequest(t, h, "GET", "/api/version", "malformed", "", 401)
+	adminRequest(t, h, "POST", "/api/auth/change-password", token, "{}", 503)
+	adminRequest(t, h, "POST", "/api/auth/login", "", `{"username":"ARTEX","password":"fixture-password"}`, 503)
+}
 
 // GetSetting 对"键不存在"和"读取出错"的返回值只差一个 error：两种情况 value 都是
 // 空串。密码相关的 handler 一旦把 error 当成"还没设置密码"，就会在数据库抖动期间
@@ -14,17 +162,12 @@ import (
 //
 // 这两个测试把 handler 的连接池关掉来制造读取失败，断言两处都 fail closed。
 func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
+	s := authTestServer(t, ":memory:")
 	// 关掉池子，让后续 GetSetting 返回 error 而不是 sql.ErrNoRows。
-	if err := m.pg.Close(); err != nil {
+	if err := s.m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s := &Server{m: m}
 	w := httptest.NewRecorder()
 	s.authStatus(w, httptest.NewRequest("GET", "/api/auth/status", nil))
 
@@ -40,16 +183,11 @@ func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 }
 
 func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
-	}
-	defer m.Close()
-	if err := m.pg.Close(); err != nil {
+	s := authTestServer(t, ":memory:")
+	if err := s.m.pg.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s := &Server{m: m}
 	w := httptest.NewRecorder()
 	body := strings.NewReader(`{"password":"correct horse battery"}`)
 	s.authInit(w, httptest.NewRequest("POST", "/api/auth/init", body))

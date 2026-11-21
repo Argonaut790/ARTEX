@@ -12,13 +12,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
 const (
 	jwtKeyFilename = "jwt.key"
-	authPassKey    = "auth.password_hash"
 	jwtTTL         = 7 * 24 * time.Hour
 	keyChars       = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -83,24 +83,60 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
-func signJWT(key []byte) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
+type adminClaims struct {
+	jwt.RegisteredClaims
+	Generation string `json:"auth_generation,omitempty"`
+}
+
+func signAdminJWT(key []byte, generation string) (string, error) {
+	now := time.Now()
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, adminClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "ARTEX",
+			ExpiresAt: jwt.NewNumericDate(now.Add(jwtTTL)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
+		Generation: generation,
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
+func parseAdminJWT(tokenStr string, key []byte) (adminClaims, error) {
+	var claims adminClaims
+	_, err := jwt.ParseWithClaims(tokenStr, &claims, func(*jwt.Token) (any, error) { return key, nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithSubject("ARTEX"), jwt.WithExpirationRequired())
+	return claims, err
+}
+
+func (s *Server) readAdminCredentials(w http.ResponseWriter, r *http.Request) (db.AdminCredentials, bool) {
+	if s.m != nil && s.m.pg != nil {
+		if credentials, err := s.m.pg.GetAdminCredentials(r.Context()); err == nil {
+			return credentials, true
 		}
-		return key, nil
-	})
-	return err == nil && t.Valid
+	}
+	writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
+	return db.AdminCredentials{}, false
+}
+
+// Check the signature before reading shared state. A missing generation on an
+// upgraded installation matches its existing JWTs until the first rotation.
+func (s *Server) authenticatedAdmin(w http.ResponseWriter, r *http.Request) (db.AdminCredentials, bool) {
+	token := extractToken(r)
+	if token == "" {
+		writeProductError(w, 401, "unauthorized", "未授权", nil)
+		return db.AdminCredentials{}, false
+	}
+	claims, err := parseAdminJWT(token, s.jwtKey)
+	if err == nil {
+		credentials, ok := s.readAdminCredentials(w, r)
+		if !ok {
+			return db.AdminCredentials{}, false
+		}
+		if claims.Generation == credentials.Generation {
+			return credentials, true
+		}
+	}
+	writeProductError(w, 401, "token_expired", "token 无效或已过期", nil)
+	return db.AdminCredentials{}, false
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -124,13 +160,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
-		tok := extractToken(r)
-		if tok == "" {
-			writeProductError(w, 401, "unauthorized", "未授权", nil)
-			return
-		}
-		if !verifyJWT(tok, s.jwtKey) {
-			writeProductError(w, 401, "token_expired", "token 无效或已过期", nil)
+		if _, ok := s.authenticatedAdmin(w, r); !ok {
 			return
 		}
 		h.ServeHTTP(w, r)
@@ -142,30 +172,20 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 // 送到 /setup 去设置密码（login/page.tsx），把数据库故障包装成 200 等于把用户往
 // 覆盖已有密码的路上推。
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
-	pg := s.pg(w)
-	if pg == nil {
+	credentials, ok := s.readAdminCredentials(w, r)
+	if !ok {
 		return
 	}
-	hash, _, err := pg.GetSetting(authPassKey)
-	if err != nil {
-		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
-		return
-	}
-	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
+	writeJSON(w, 200, map[string]any{"initialized": credentials.PasswordHash != ""})
 }
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
-	pg := s.pg(w)
-	if pg == nil {
+	credentials, ok := s.readAdminCredentials(w, r)
+	if !ok {
 		return
 	}
-	existing, _, err := pg.GetSetting(authPassKey)
-	if err != nil {
-		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
-		return
-	}
-	if existing != "" {
+	if credentials.PasswordHash != "" {
 		writeProductError(w, 403, "password_already_set", "密码已设置", nil)
 		return
 	}
@@ -181,41 +201,43 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 400, code, msg, params)
 		return
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	s.replaceAdminPassword(w, r, credentials, req.Password)
+}
+
+func (s *Server) replaceAdminPassword(w http.ResponseWriter, r *http.Request, old db.AdminCredentials, password string) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		writeProductError(w, 500, "password_hash_failed", "密码加密失败", nil)
 		return
 	}
-	// 用 INSERT ... ON CONFLICT DO NOTHING 而不是 upsert：上面那次 GetSetting 只是
-	// 快速失败路径，真正"仅首次可设"的保证落在主键约束上。bcrypt 要跑几十毫秒，
-	// 这期间别的请求完全可能先把密码设好，而读检查本身也可能因故障而失效。
-	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
-	if err != nil {
-		writeProductError(w, 500, "save_failed", "保存失败: "+err.Error(), nil)
-		return
-	}
-	if !inserted {
-		writeProductError(w, 403, "password_already_set", "密码已设置", nil)
-		return
-	}
-	tok, err := signJWT(s.jwtKey)
+	next := db.AdminCredentials{PasswordHash: string(hash), Generation: rand.Text()}
+	token, err := signAdminJWT(s.jwtKey, next.Generation)
 	if err != nil {
 		writeProductError(w, 500, "token_failed", "token 生成失败", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"token": tok})
+	replaced, err := s.m.pg.ReplaceAdminCredentials(r.Context(), old, next)
+	if err != nil {
+		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
+		return
+	}
+	if !replaced {
+		if old.PasswordHash == "" {
+			writeProductError(w, 403, "password_already_set", "密码已设置", nil)
+		} else {
+			writeProductError(w, 401, "token_expired", "token 无效或已过期", nil)
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "token": token})
 }
 
 // POST /api/auth/change-password — changes the admin password. Requires a valid
 // token (this route is under /api/auth/* which requireAuth exempts, so the token
 // is validated here) AND the current password.
 func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
-	pg := s.pg(w)
-	if pg == nil {
-		return
-	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
-		writeProductError(w, 401, "unauthorized", "未授权", nil)
+	credentials, ok := s.authenticatedAdmin(w, r)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -235,37 +257,19 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 400, code, msg, params)
 		return
 	}
-	hash, ok, err := pg.GetSetting(authPassKey)
-	if err != nil {
-		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
-		return
-	}
-	if !ok || hash == "" {
+	if credentials.PasswordHash == "" {
 		writeProductError(w, 403, "password_not_initialized", "密码未初始化，请先设置密码", nil)
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.OldPassword)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(credentials.PasswordHash), []byte(req.OldPassword)); err != nil {
 		writeProductError(w, 401, "current_password_incorrect", "当前密码错误", nil)
 		return
 	}
-	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		writeProductError(w, 500, "password_hash_failed", "密码加密失败", nil)
-		return
-	}
-	if err := pg.SetSetting(authPassKey, string(newHash)); err != nil {
-		writeProductError(w, 500, "save_failed", "保存失败: "+err.Error(), nil)
-		return
-	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	s.replaceAdminPassword(w, r, credentials, req.NewPassword)
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
-	pg := s.pg(w)
-	if pg == nil {
-		return
-	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -278,20 +282,19 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 401, "invalid_credentials", "用户名或密码错误", nil)
 		return
 	}
-	hash, ok, err := pg.GetSetting(authPassKey)
-	if err != nil {
-		writeProductError(w, 503, "data_unavailable", errDataSourceUnavailable, nil)
+	credentials, ok := s.readAdminCredentials(w, r)
+	if !ok {
 		return
 	}
-	if !ok || hash == "" {
+	if credentials.PasswordHash == "" {
 		writeProductError(w, 403, "password_not_initialized", "密码未初始化，请先设置密码", nil)
 		return
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(credentials.PasswordHash), []byte(req.Password)); err != nil {
 		writeProductError(w, 401, "invalid_credentials", "用户名或密码错误", nil)
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signAdminJWT(s.jwtKey, credentials.Generation)
 	if err != nil {
 		writeProductError(w, 500, "token_failed", "token 生成失败", nil)
 		return

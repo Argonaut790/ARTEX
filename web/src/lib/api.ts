@@ -147,6 +147,7 @@ function getToken(): string | null {
 
 let basicAuthReloading = false;
 let basicAuthProbe: Promise<void> | null = null;
+let pendingPasswordChange: Promise<unknown> | undefined;
 
 // Renew the outer gate through a page navigation, where the browser can send
 // Basic credentials without replacing an API request's Bearer authorization.
@@ -250,10 +251,16 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    if (r.status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
+    if (r.status === 401 && code !== "current_password_incorrect" && typeof window !== "undefined") {
+      // The server can revoke the old token before this tab receives its replacement.
+      if (path !== "/auth/change-password" && pendingPasswordChange) {
+        await pendingPasswordChange.catch(() => {});
+      }
+      if (!basicAuthReloading && getToken() === token) {
+        localStorage.removeItem("artex_token");
+        document.cookie = "artex_token=; path=/; max-age=0";
+        window.location.href = "/login";
+      }
     }
     throw new ApiError(message, code, params);
   }
@@ -420,8 +427,22 @@ export const api = {
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
-  changePassword: (oldPassword: string, newPassword: string) =>
-    post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+  changePassword: async (oldPassword: string, newPassword: string, saveToken: (token: string) => void) => {
+    const originalToken = getToken();
+    const change = post<{ ok: boolean; token: string }>("/auth/change-password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    }).then((result) => {
+      if (result.token && getToken() === originalToken) saveToken(result.token);
+      return result;
+    });
+    pendingPasswordChange = change;
+    try {
+      return await change;
+    } finally {
+      if (pendingPasswordChange === change) pendingPasswordChange = undefined;
+    }
+  },
 
   // ---- tasks ----
   tasks: () =>

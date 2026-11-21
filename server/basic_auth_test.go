@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Autumn-27/artex/db"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -37,7 +38,7 @@ func (m *basicAuthMemoryStore) SetSettingContext(ctx context.Context, _ string, 
 func basicAuthTestServer(t *testing.T) (*Server, *basicAuthMemoryStore) {
 	t.Helper()
 	store := &basicAuthMemoryStore{}
-	s := &Server{jwtKey: []byte("test-only-signing-key-32-characters")}
+	s := authTestServer(t, ":memory:")
 	if err := s.basicAuth.load(store); err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +434,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	for _, key := range []string{basicAuthKey, authPassKey} {
+	for _, key := range []string{basicAuthKey, db.AdminPasswordKey} {
 		old, exists, err := m.pg.GetSetting(key)
 		if err != nil {
 			t.Fatal(err)
@@ -453,14 +454,18 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.pg.SetSetting(authPassKey, string(hash)); err != nil {
+	if err := m.pg.SetSetting(db.AdminPasswordKey, string(hash)); err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{m: m, jwtKey: []byte("test-only-signing-key-32-characters")}
 	if err := s.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
+	credentials, err := m.pg.GetAdminCredentials(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminJWT, err := signAdminJWT(s.jwtKey, credentials.Generation)
 	if err != nil {
 		t.Fatal(err)
 	}

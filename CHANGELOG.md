@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+- 管理员修改密码后，先前的登录令牌失效。修改密码的浏览器会保存新令牌；直接调用此 API 的客户端应使用成功响应中的 `token`。使用紧急重设脚本后需重新登录。
+- 漏洞详情可以就地检查已保存报告的章节、CVSS 4.0 基础评分和已有 HTTP 请求与响应的配对。检查只读取报告正文。CVSS 计算器的来源及许可见 [第三方声明](web/public/third-party-notices.txt)。
+
+这两项改动参考 [ARTEX-Pro 的对应版本](https://github.com/wpsec/ARTEX-Pro/tree/9a0785aaeaba90e12b4e32e73b292fbf1b8ee4e2)，并适配本分支的登录及报告格式。
+
 ## [0.3.30] - 2026-11-14
 
 ### 新增与改进

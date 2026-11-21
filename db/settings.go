@@ -3,8 +3,71 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sort"
 )
+
+const (
+	AdminPasswordKey   = "auth.password_hash"
+	adminGenerationKey = "auth.session_generation"
+)
+
+type AdminCredentials struct {
+	PasswordHash string
+	Generation   string // Empty only for installations without a generation row.
+}
+
+// GetAdminCredentials reads the hash and generation from the same SQL snapshot.
+func (d *DB) GetAdminCredentials(ctx context.Context) (AdminCredentials, error) {
+	var hash, generation sql.NullString
+	err := d.QueryRowContext(ctx, `SELECT
+		(SELECT value FROM settings WHERE key=$1),
+		(SELECT value FROM settings WHERE key=$2)`, AdminPasswordKey, adminGenerationKey).Scan(&hash, &generation)
+	if err != nil {
+		return AdminCredentials{}, err
+	}
+	if (hash.Valid && hash.String == "") || (generation.Valid && generation.String == "") {
+		return AdminCredentials{}, errors.New("empty admin credential setting")
+	}
+	return AdminCredentials{PasswordHash: hash.String, Generation: generation.String}, nil
+}
+
+// ReplaceAdminCredentials commits both settings only if each old value still
+// matches. Always lock the password row first, including in reset-password.sh.
+func (d *DB) ReplaceAdminCredentials(ctx context.Context, old, next AdminCredentials) (bool, error) {
+	if next.PasswordHash == "" || next.Generation == "" {
+		return false, errors.New("incomplete admin credentials")
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	for _, setting := range []struct{ key, old, next string }{
+		{AdminPasswordKey, old.PasswordHash, next.PasswordHash},
+		{adminGenerationKey, old.Generation, next.Generation},
+	} {
+		var res sql.Result
+		if setting.old == "" {
+			res, err = tx.ExecContext(ctx, `INSERT INTO settings(key, value) VALUES ($1, $2)
+				ON CONFLICT (key) DO NOTHING`, setting.key, setting.next)
+		} else {
+			res, err = tx.ExecContext(ctx, `UPDATE settings SET value=$1, updated_at=CURRENT_TIMESTAMP
+				WHERE key=$2 AND value=$3`, setting.next, setting.key, setting.old)
+		}
+		if err != nil {
+			return false, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 // Settings is a tiny key-value store for global app config the UI toggles at
 // runtime (e.g. traffic_capture). Missing keys fall back to caller defaults.

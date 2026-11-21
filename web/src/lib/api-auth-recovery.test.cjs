@@ -116,6 +116,42 @@ test("uploads and downloads also recover the Basic gate", async () => {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("a protected 401 cannot clear a password change in either response order", async () => {
+  for (const earlyFailure of [true, false]) {
+    let releaseChange;
+    let releaseFailure;
+    const changeResponse = new Promise((resolve) => { releaseChange = resolve; });
+    const failureResponse = new Promise((resolve) => { releaseFailure = resolve; });
+    const c = client((url) => url === "/api/auth/change-password" ? changeResponse : failureResponse);
+    const failedRequest = assert.rejects(c.http("/version"), (error) => error.code === "token_expired");
+    const changing = c.api.changePassword("fixture-password", "replacement-password", (token) => {
+      c.state.token = token;
+      c.document.cookie = `artex_token=${token}`;
+    });
+    const failure = () => releaseFailure(new Response('{"code":"token_expired"}', { status: 401 }));
+    if (earlyFailure) {
+      failure();
+      await tick();
+      assertSessionPreserved(c);
+    }
+    releaseChange(new Response('{"ok":true,"token":"replacement-token"}'));
+    await changing;
+    if (!earlyFailure) failure();
+    await failedRequest;
+    assert.equal(c.state.token, "replacement-token");
+    assert.equal(c.document.cookie, "artex_token=replacement-token");
+    assert.equal(c.location.href, "http://localhost/function/tasks/?page=2");
+  }
+});
+
+test("a wrong current password leaves the existing login available for retry", async () => {
+  const c = client(() => new Response('{"code":"current_password_incorrect"}', { status: 401 }));
+  await assert.rejects(c.api.changePassword("incorrect", "replacement-password", () => {
+    assert.fail("a failed change attempted to replace the token");
+  }), (error) => error.code === "current_password_incorrect");
+  assertSessionPreserved(c);
+});
+
 test("SSE failures probe the same-origin gate once for concurrent streams", async () => {
   const c = client(async () => gateFailure());
   const first = c.openSSE("/api/logs/stream");
